@@ -1,34 +1,73 @@
-import Client, { CommitmentLevel, SubscribeRequest } from "@triton-one/yellowstone-grpc";
+import * as grpc from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
+import * as path from "path";
+import type { ProtoGrpcType } from "./proto/geyser";
+import type { GeyserClient } from "./proto/geyser/Geyser";
+import type { SubscribeRequest } from "./proto/geyser/SubscribeRequest";
+import { CommitmentLevel } from "./proto/geyser/CommitmentLevel";
 
 async function main() {
-  // Connect to Lantern's gRPC server
-  const endpoint = process.env.LANTERN_GRPC_ADDR || "YOUR_ENDPOINT_HERE";
-  const token = process.env.X_TOKEN; // Optional auth token
+  const endpoint = process.env.YELLOWSTONE_GRPC_ADDR || "134.122.90.96:8080";
+  const token = process.env.X_TOKEN || "600a1d07-08eb-48eb-98c0-6e2ce8650a85";
   
   console.log(`Connecting to: ${endpoint}`);
 
-  // Create client
-  const client = new Client(endpoint, token, {
-    "grpc.max_receive_message_length": 64 * 1024 * 1024, // 64MiB
+  const protoPath = path.join(__dirname, "proto/geyser.proto");
+  const packageDefinition = await protoLoader.load(protoPath, {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+    includeDirs: [path.join(__dirname, "proto")],
   });
 
-  try {
-    // Test connection
-    console.log("Testing connection...");
-    console.log("Ping:", await client.ping(1));
-    console.log("Version:", await client.getVersion());
+  const proto = grpc.loadPackageDefinition(packageDefinition) as unknown as ProtoGrpcType;
+  
+  const credentials = grpc.credentials.createInsecure();
+  const metadata = new grpc.Metadata();
+  if (token) {
+    metadata.add("x-token", token);
+  }
 
-    // Subscribe to updates
-    await subscribe(client);
+  const client = new proto.geyser.Geyser(
+    endpoint,
+    credentials,
+    {
+      "grpc.max_receive_message_length": 64 * 1024 * 1024,
+    }
+  ) as GeyserClient;
+
+  try {
+    console.log("Testing connection...");
+    
+    const pingRequest = { count: 1 };
+    const pingResponse = await new Promise((resolve, reject) => {
+      client.ping(pingRequest, metadata, (err, response) => {
+        if (err) reject(err);
+        else resolve(response);
+      });
+    });
+    console.log("Ping:", pingResponse);
+
+    const versionRequest = {};
+    const versionResponse = await new Promise((resolve, reject) => {
+      client.getVersion(versionRequest, metadata, (err, response) => {
+        if (err) reject(err);
+        else resolve(response);
+      });
+    });
+    console.log("Version:", versionResponse);
+
+    await subscribe(client, metadata);
     
   } catch (error) {
     console.error("Error:", error);
   } 
 }
 
-async function subscribe(client: Client) {
-  // Create subscription stream
-  const stream = await client.subscribe();
+async function subscribe(client: GeyserClient, metadata: grpc.Metadata) {
+  const stream = client.subscribe(metadata);
 
   // Handle stream events
   stream.on("data", (data) => {
@@ -56,7 +95,6 @@ async function subscribe(client: Client) {
         account: [], // Add specific account pubkeys here
         owner: [
           "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token Program
-          "YourProgramIdHere",              // System Program
         ],
         filters: []
       }
@@ -67,13 +105,11 @@ async function subscribe(client: Client) {
       }
     },
     transactions: {},
-    transactionsStatus: {},
     entry: {},
     blocks: {},
     blocksMeta: {},
-    commitment: CommitmentLevel.CONFIRMED,
+    commitment: CommitmentLevel.CONFIRMED as any,
     accountsDataSlice: [],
-    ping: undefined,
   };
 
   // Send subscription request

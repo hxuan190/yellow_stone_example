@@ -6,17 +6,17 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/yellowstone-client.js",
-    "dev": "ts-node yellowstone-client.ts"
+    "dev": "ts-node client.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.9.0",
     "@grpc/proto-loader": "^0.7.0",
-    "@triton-one/yellowstone-grpc": "^4.0.2",
     "ts-protoc-gen": "^0.15.0"
   },
   "devDependencies": {
     "@types/google-protobuf": "^3.15.0",
     "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
     "ts-proto": "^1.176.0",
     "typescript": "^5.0.0"
   },
