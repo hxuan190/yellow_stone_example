@@ -2,25 +2,43 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 	"yellow_stone_example/proto"
 
+	"github.com/gagliardetto/solana-go"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 )
 
 type YellowstoneClient struct {
-	client proto.GeyserClient
-	conn   *grpc.ClientConn
+	client    proto.GeyserClient
+	conn      *grpc.ClientConn
+	jsonFile  *os.File
+	jsonMutex sync.Mutex
+	token     string
 }
 
-func NewYellowstoneClient(serverAddr string) (*YellowstoneClient, error) {
+type AccountUpdateJSON struct {
+	Timestamp time.Time `json:"timestamp"`
+	Filters   []string  `json:"filters"`
+	Pubkey    string    `json:"pubkey"`
+	Lamports  uint64    `json:"lamports"`
+	Owner     string    `json:"owner"`
+	DataSize  int       `json:"data_size"`
+	Data      string    `json:"data"`
+}
+
+func NewYellowstoneClient(serverAddr string, token string) (*YellowstoneClient, error) {
+
 	conn, err := grpc.NewClient(serverAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -33,25 +51,43 @@ func NewYellowstoneClient(serverAddr string) (*YellowstoneClient, error) {
 		return nil, fmt.Errorf("failed to connect: %v", err)
 	}
 
+	jsonFile, err := os.OpenFile("account_updates.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open JSON file: %v", err)
+	}
+
 	return &YellowstoneClient{
-		client: proto.NewGeyserClient(conn),
-		conn:   conn,
+		client:   proto.NewGeyserClient(conn),
+		conn:     conn,
+		jsonFile: jsonFile,
+		token:    token,
 	}, nil
 }
 
 func (yc *YellowstoneClient) Close() error {
+	if yc.jsonFile != nil {
+		yc.jsonFile.Close()
+	}
 	return yc.conn.Close()
 }
 
+func (yc *YellowstoneClient) getMetadata(ctx context.Context) context.Context {
+	if yc.token != "" {
+		md := metadata.New(map[string]string{"x-token": yc.token})
+		return metadata.NewOutgoingContext(ctx, md)
+	}
+	return ctx
+}
+
 func (yc *YellowstoneClient) TestConnection(ctx context.Context) error {
-	// Test ping
+	ctx = yc.getMetadata(ctx)
+
 	pingResp, err := yc.client.Ping(ctx, &proto.PingRequest{Count: 1})
 	if err != nil {
 		return fmt.Errorf("ping failed: %v", err)
 	}
 	log.Info().Int32("count", pingResp.Count).Msg("Ping successful")
 
-	// Test version
 	versionResp, err := yc.client.GetVersion(ctx, &proto.GetVersionRequest{})
 	if err != nil {
 		return fmt.Errorf("version check failed: %v", err)
@@ -62,17 +98,16 @@ func (yc *YellowstoneClient) TestConnection(ctx context.Context) error {
 }
 
 func (yc *YellowstoneClient) SubscribeToAccounts(ctx context.Context, accounts []string, owners []string) error {
-	// Create subscription request
+	ctx = yc.getMetadata(ctx)
+
 	req := &proto.SubscribeRequest{
-		Accounts: map[string]*proto.SubscribeRequestFilterAccounts{
-			"account_filter": {
-				Account: accounts,
-				Owner:   owners,
+		Transactions: map[string]*proto.SubscribeRequestFilterTransactions{
+			"transaction_filter": {
+				Accounts: accounts,
 			},
 		},
 	}
 
-	// Establish bidirectional stream
 	stream, err := yc.client.Subscribe(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to subscribe: %v", err)
@@ -107,10 +142,6 @@ func (yc *YellowstoneClient) handleUpdates(stream proto.Geyser_SubscribeClient) 
 			yc.handleAccountUpdate(update.Filters, account)
 		}
 
-		// Handle slot updates
-		if slot := update.GetSlot(); slot != nil {
-			yc.handleSlotUpdate(update.Filters, &proto.SubscribeUpdate_Slot{Slot: slot})
-		}
 	}
 }
 
@@ -123,22 +154,30 @@ func (yc *YellowstoneClient) handleAccountUpdate(filters []string, account *prot
 		Int("data_size", len(account.Account.Data)).
 		Msg("Account update received")
 
-	// Process account data here
-	// You can decode the account data based on the owner program
+	updateJSON := AccountUpdateJSON{
+		Timestamp: time.Now(),
+		Filters:   filters,
+		Pubkey:    string(account.Account.Pubkey),
+		Lamports:  account.Account.Lamports,
+		Owner:     string(account.Account.Owner),
+		DataSize:  len(account.Account.Data),
+		Data:      fmt.Sprintf("%x", account.Account.Data),
+	}
+
+	yc.jsonMutex.Lock()
+	defer yc.jsonMutex.Unlock()
+
+	encoder := json.NewEncoder(yc.jsonFile)
+	if err := encoder.Encode(updateJSON); err != nil {
+		log.Error().Err(err).Msg("Failed to write to JSON file")
+		return
+	}
+
 	if len(account.Account.Data) > 0 {
 		log.Debug().
 			Str("data_hex", fmt.Sprintf("%x", account.Account.Data[:min(32, len(account.Account.Data))])).
 			Msg("Account data preview")
 	}
-}
-
-func (yc *YellowstoneClient) handleSlotUpdate(filters []string, slot *proto.SubscribeUpdate_Slot) {
-	log.Info().
-		Strs("filters", filters).
-		Uint64("slot", slot.Slot.Slot).
-		Uint64("parent", *slot.Slot.Parent).
-		Str("status", slot.Slot.Status.String()).
-		Msg("Slot update received")
 }
 
 func (yc *YellowstoneClient) SubscribeWithReconnection(ctx context.Context, accounts []string, owners []string) {
@@ -163,17 +202,19 @@ func min(a, b int) int {
 }
 
 func main() {
-	// Configure logging
-
-	// Connect to Lantern's gRPC server
-	serverAddr := "YOUR_ENDPOINT_HERE"
-	if addr := os.Getenv("LANTERN_GRPC_ADDR"); addr != "" {
+	serverAddr := "134.122.90.96:8888"
+	if addr := os.Getenv("YELLOWSTONE_GRPC_ADDR"); addr != "" {
 		serverAddr = addr
+	}
+
+	token := os.Getenv("X_TOKEN")
+	if token == "" {
+		token = "600a1d07-08eb-48eb-98c0-6e2ce8650a85"
 	}
 
 	log.Info().Str("server", serverAddr).Msg("Connecting to Lantern gRPC server")
 
-	client, err := NewYellowstoneClient(serverAddr)
+	client, err := NewYellowstoneClient(serverAddr, token)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create client")
 	}
@@ -187,16 +228,17 @@ func main() {
 
 	// Example accounts to subscribe to
 	accounts := []string{
-		// Add your account public keys here
-		// "YourAccountPublicKeyHere",
-		// "AnotherAccountPublicKeyHere",
+		"2w6P8h6DAxFU8TmfF9sSyJxKqditymLFHTTpxE94d6fq",
 	}
 
 	// Example program owners to subscribe to
 	owners := []string{
-		"FLUXubRmkEi2q6K3Y9kBPg9248ggaZVsoSFhtJHSrm1X", // FluxBeam program
-		"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // Token program
-		"CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", // Raydium AMM
+		solana.SystemProgramID.String(),
+		solana.TokenProgramID.String(),
+		solana.Token2022ProgramID.String(),
+		solana.SPLAssociatedTokenAccountProgramID.String(),
+		solana.TokenMetadataProgramID.String(),
+		solana.MemoProgramID.String(),
 	}
 
 	// Start subscription with reconnection
